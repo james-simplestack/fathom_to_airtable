@@ -248,7 +248,13 @@ def fetch_fathom_call_data(recording_id):
                 duration = int(duration_seconds)
             except:
                 pass
-        
+
+        # Prepare URLs
+        recording_url = meeting.get('url') or meeting.get('share_url')
+        embed_url = None
+        if recording_url:
+            embed_url = recording_url.replace('/share/', '/embed/')
+
         # Extract relevant fields matching the expected structure
         call_info = {
             'call_id': str(recording_id),  # Keep for backward compatibility
@@ -258,7 +264,8 @@ def fetch_fathom_call_data(recording_id):
             'start_time': meeting.get('recording_start_time') or meeting.get('scheduled_start_time'),
             'end_time': meeting.get('recording_end_time') or meeting.get('scheduled_end_time'),
             'duration': duration,
-            'recording_url': meeting.get('url') or meeting.get('share_url'),
+            'recording_url': recording_url,
+            'embed_url': embed_url,   # <--- New Field
             'summary': summary_text,
             'action_items': action_items,
             'participants': participants,
@@ -266,6 +273,7 @@ def fetch_fathom_call_data(recording_id):
         }
         
         return call_info
+        
         
     except requests.exceptions.RequestException as e:
         print(f"Error fetching Fathom call data: {str(e)}")
@@ -434,7 +442,12 @@ def upload_meeting_to_airtable(call_data):
     # Recording URL - string
     if call_data.get('recording_url') and 'Recording URL' not in linked_record_fields:
         fields['Recording URL'] = str(call_data.get('recording_url'))
-    
+
+   
+    # Embed URL - string
+    if call_data.get('embed_url') and 'Embed URL' not in linked_record_fields:
+        fields['Embed URL'] = str(call_data.get('embed_url'))
+
     # Summary - string
     if call_data.get('summary') and 'Summary' not in linked_record_fields:
         fields['Summary'] = str(call_data.get('summary'))
