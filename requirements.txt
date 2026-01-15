@@ -1,0 +1,4 @@
+functions-framework==3.*
+requests==2.*
+flask==3.*
+python-dotenv==1.*
