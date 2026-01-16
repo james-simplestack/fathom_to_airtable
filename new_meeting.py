@@ -1,649 +1,562 @@
+"""
+Single-file Fathom -> Airtable webhook handler.
+
+Deploy/start with Functions Framework:
+  functions-framework --source new_meeting.py --target fathom_webhook --port $PORT
+
+Behavior:
+- POST / : expects JSON containing recording_id or call_id
+- GET /  : returns last received payload (instance-local, best-effort), optionally protected by WEBHOOK_DEBUG_TOKEN
+
+Required env vars:
+- FATHOM_API_KEY
+- AIRTABLE_API_KEY
+- AIRTABLE_BASE_ID
+- AIRTABLE_MEETINGS_TABLE
+- AIRTABLE_ACTION_ITEMS_TABLE
+
+Optional env vars:
+- AIRTABLE_PARTICIPANTS_TABLE (default: People)
+- CONNECT_TIMEOUT_S (default: 5)
+- READ_TIMEOUT_S (default: 25)
+- WEBHOOK_DEBUG_TOKEN (protects GET /)
+- WEBHOOK_PAYLOAD_STORE_PATH (default: /tmp/last_webhook_payload.json)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import functions_framework
 import requests
-import os
-import re
-from datetime import datetime
-from flask import jsonify
 from dotenv import load_dotenv
+from flask import jsonify
 
-# Load environment variables
+
+# Load environment variables from .env when running locally
 load_dotenv()
 
-# Environment variables - set these in GCP Cloud Functions
-FATHOM_API_KEY = os.environ.get('FATHOM_API_KEY')
-AIRTABLE_API_KEY = os.environ.get('AIRTABLE_API_KEY')
-AIRTABLE_BASE_ID = os.environ.get('AIRTABLE_BASE_ID')
-AIRTABLE_MEETINGS_TABLE = os.environ.get('AIRTABLE_MEETINGS_TABLE')
-AIRTABLE_ACTION_ITEMS_TABLE = os.environ.get('AIRTABLE_ACTION_ITEMS_TABLE')
-AIRTABLE_PARTICIPANTS_TABLE = os.environ.get('AIRTABLE_PARTICIPANTS_TABLE', 'People')  # Default to 'People' table
+
+# --- Configuration ---
+CONNECT_TIMEOUT_S = float(os.environ.get("CONNECT_TIMEOUT_S", "5"))
+READ_TIMEOUT_S = float(os.environ.get("READ_TIMEOUT_S", "25"))
+TIMEOUT = (CONNECT_TIMEOUT_S, READ_TIMEOUT_S)
+
+FATHOM_API_KEY = os.environ.get("FATHOM_API_KEY")
+AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
+AIRTABLE_MEETINGS_TABLE = os.environ.get("AIRTABLE_MEETINGS_TABLE")
+AIRTABLE_ACTION_ITEMS_TABLE = os.environ.get("AIRTABLE_ACTION_ITEMS_TABLE")
+AIRTABLE_PARTICIPANTS_TABLE = os.environ.get("AIRTABLE_PARTICIPANTS_TABLE", "People")
+
+WEBHOOK_DEBUG_TOKEN = os.environ.get("WEBHOOK_DEBUG_TOKEN")
+WEBHOOK_PAYLOAD_STORE_PATH = os.environ.get("WEBHOOK_PAYLOAD_STORE_PATH", "/tmp/last_webhook_payload.json")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log(event: str, **fields: Any) -> None:
+    """
+    Structured logging for Cloud Run. Prints one-line JSON for easy filtering.
+    """
+    record = {"event": event, "ts": time.time(), **fields}
+    try:
+        print(json.dumps(record, ensure_ascii=False), flush=True)
+    except Exception:
+        print(f"{event} {fields}", flush=True)
+
+
+def save_last_payload(*, payload: Any, meta: Optional[Dict[str, Any]] = None) -> None:
+    record: Dict[str, Any] = {"received_at": _utc_now_iso(), "payload": payload}
+    if meta:
+        record["meta"] = meta
+
+    parent_dir = os.path.dirname(WEBHOOK_PAYLOAD_STORE_PATH) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=parent_dir, encoding="utf-8") as tmp:
+        json.dump(record, tmp, ensure_ascii=False, indent=2)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+    os.replace(tmp_path, WEBHOOK_PAYLOAD_STORE_PATH)
+
+
+def load_last_payload() -> Optional[Dict[str, Any]]:
+    if not os.path.exists(WEBHOOK_PAYLOAD_STORE_PATH):
+        return None
+    try:
+        with open(WEBHOOK_PAYLOAD_STORE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 
 @functions_framework.http
 def fathom_webhook(request):
     """
-    HTTP Cloud Function to handle Fathom webhooks and sync to Airtable.
-    Triggered by Fathom when a new recording is available.
+    HTTP handler:
+    - POST: receives {recording_id/call_id}, fetches details from Fathom, writes to Airtable
+    - GET: returns last received payload (best-effort), optionally protected by WEBHOOK_DEBUG_TOKEN
     """
-    
-    # Verify the request method
-    if request.method != 'POST':
-        return jsonify({'error': 'Only POST requests are allowed'}), 405
-    
-    try:
-        # Parse the webhook payload from Fathom
-        webhook_data = request.get_json()
-        
-        if not webhook_data:
-            return jsonify({'error': 'No data received'}), 400
-        
-        # Extract the recording ID from the webhook (Fathom uses recording_id)
-        recording_id = webhook_data.get('recording_id') or webhook_data.get('call_id')
-        
-        if not recording_id:
-            return jsonify({'error': 'No recording_id or call_id in webhook data'}), 400
-        
-        print(f"Processing Fathom recording: {recording_id}")
-        
-        # Fetch detailed call data from Fathom API
-        call_data = fetch_fathom_call_data(recording_id)
-        
-        if not call_data:
-            return jsonify({'error': 'Failed to fetch call data from Fathom'}), 500
-        
-        # Upload meeting to Airtable
-        meeting_record = upload_meeting_to_airtable(call_data)
-        
-        if not meeting_record:
-            return jsonify({'error': 'Failed to upload meeting to Airtable'}), 500
-        
-        meeting_record_id = meeting_record.get('id')
-        
-        # Create action item records
-        action_items_created = create_action_items(
-            call_data.get('action_items', []),
-            meeting_record_id,
-            call_data.get('title')
+
+    debug_request_id = request.headers.get("X-Debug-Request-Id") or request.headers.get("X-Request-Id")
+    trace = request.headers.get("X-Cloud-Trace-Context")
+    started_at = time.time()
+
+    if request.method == "GET":
+        provided = (
+            request.headers.get("X-Debug-Token")
+            or request.headers.get("X-Webhook-Debug-Token")
+            or request.args.get("token")
         )
-        
-        return jsonify({
-            'status': 'success',
-            'message': 'Recording synced to Airtable',
-            'recording_id': recording_id,
-            'meeting_record_id': meeting_record_id,
-            'action_items_created': action_items_created
-        }), 200
-            
+        if WEBHOOK_DEBUG_TOKEN and provided != WEBHOOK_DEBUG_TOKEN:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        last = load_last_payload()
+        if not last:
+            return jsonify({"status": "empty"}), 404
+        return jsonify(last), 200
+
+    if request.method != "POST":
+        return jsonify({"error": "Only POST requests are allowed"}), 405
+
+    stage = "start"
+    try:
+        _log(
+            "webhook_start",
+            debug_request_id=debug_request_id,
+            trace=trace,
+            method=request.method,
+            content_type=request.headers.get("Content-Type"),
+        )
+
+        missing = []
+        if not FATHOM_API_KEY:
+            missing.append("FATHOM_API_KEY")
+        if not AIRTABLE_API_KEY:
+            missing.append("AIRTABLE_API_KEY")
+        if not AIRTABLE_BASE_ID:
+            missing.append("AIRTABLE_BASE_ID")
+        if not AIRTABLE_MEETINGS_TABLE:
+            missing.append("AIRTABLE_MEETINGS_TABLE")
+        if not AIRTABLE_ACTION_ITEMS_TABLE:
+            missing.append("AIRTABLE_ACTION_ITEMS_TABLE")
+        if missing:
+            _log("config_missing", debug_request_id=debug_request_id, missing=missing)
+            return jsonify({"error": "Missing required environment variables", "missing": missing}), 500
+
+        stage = "parse_payload"
+        _log("stage", debug_request_id=debug_request_id, stage=stage)
+        webhook_data = request.get_json(silent=True)
+        if not webhook_data:
+            return jsonify({"error": "No data received", "stage": stage}), 400
+
+        recording_id = webhook_data.get("recording_id") or webhook_data.get("call_id")
+        if not recording_id:
+            return jsonify({"error": "No recording_id or call_id in webhook data", "stage": stage}), 400
+
+        # Best-effort persistence for debugging (instance-local)
+        try:
+            safe_headers = {}
+            for k in ["Content-Type", "User-Agent", "X-Forwarded-For", "X-Forwarded-Proto", "X-Cloud-Trace-Context"]:
+                v = request.headers.get(k)
+                if v:
+                    safe_headers[k] = v
+            save_last_payload(
+                payload=webhook_data,
+                meta={
+                    "debug_request_id": debug_request_id,
+                    "recording_id": str(recording_id),
+                    "headers": safe_headers,
+                },
+            )
+        except Exception:
+            pass
+
+        _log("recording_received", debug_request_id=debug_request_id, recording_id=str(recording_id))
+
+        stage = "fetch_fathom_call_data"
+        t0 = time.time()
+        _log("stage", debug_request_id=debug_request_id, stage=stage)
+        call_data = fetch_fathom_call_data(recording_id)
+        _log("stage_done", debug_request_id=debug_request_id, stage=stage, duration_s=round(time.time() - t0, 3))
+        if not call_data:
+            return jsonify({"error": "Failed to fetch call data from Fathom", "stage": stage}), 500
+
+        stage = "upload_meeting_to_airtable"
+        t0 = time.time()
+        _log("stage", debug_request_id=debug_request_id, stage=stage)
+        meeting_record = upload_meeting_to_airtable(call_data)
+        _log("stage_done", debug_request_id=debug_request_id, stage=stage, duration_s=round(time.time() - t0, 3))
+        if not meeting_record:
+            return jsonify({"error": "Failed to upload meeting to Airtable", "stage": stage}), 500
+
+        meeting_record_id = meeting_record.get("id")
+
+        stage = "create_action_items"
+        t0 = time.time()
+        _log("stage", debug_request_id=debug_request_id, stage=stage)
+        action_items_created = create_action_items(
+            call_data.get("action_items", []),
+            meeting_record_id,
+            call_data.get("title"),
+        )
+        _log("stage_done", debug_request_id=debug_request_id, stage=stage, duration_s=round(time.time() - t0, 3))
+
+        _log(
+            "webhook_success",
+            debug_request_id=debug_request_id,
+            recording_id=str(recording_id),
+            meeting_record_id=meeting_record_id,
+            action_items_created=action_items_created,
+            total_duration_s=round(time.time() - started_at, 3),
+        )
+
+        return (
+            jsonify(
+                {
+                    "status": "success",
+                    "message": "Recording synced to Airtable",
+                    "recording_id": recording_id,
+                    "meeting_record_id": meeting_record_id,
+                    "action_items_created": action_items_created,
+                    "debug_request_id": debug_request_id,
+                }
+            ),
+            200,
+        )
+
     except Exception as e:
-        print(f"Error processing webhook: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        _log("webhook_error", debug_request_id=debug_request_id, stage=stage, error=str(e))
+        return jsonify({"error": str(e), "stage": stage, "debug_request_id": debug_request_id}), 500
 
 
-def meeting_has_participant(meeting, participant_name):
-    """
-    Check if a meeting has a specific participant.
-    Returns True if the participant is found, False otherwise.
-    """
-    if not meeting or not participant_name:
-        return False
-    
-    # Check calendar_invitees
-    for invitee in meeting.get('calendar_invitees', []):
-        name = invitee.get('name', '')
-        email = invitee.get('email', '')
-        # Check if name matches (case-insensitive)
-        if participant_name.lower() in name.lower() or participant_name.lower() in email.lower():
-            return True
-    
-    return False
-
-def get_meeting_id_from_call_id(call_id, participant_filter=None):
-    """
-    Get the meeting ID from a call/recording ID.
-    Optionally filter by participant name (e.g., "James Nevada").
-    Returns the meeting ID (id field) or None if not found.
-    """
+def fetch_fathom_call_data(recording_id: Any) -> Optional[Dict[str, Any]]:
     url = "https://api.fathom.ai/external/v1/meetings"
-    headers = {
-        'X-Api-Key': FATHOM_API_KEY,
-        'Content-Type': 'application/json'
-    }
-    
-    params = {
-        'include_action_items': 'false',
-        'include_summary': 'false',
-        'include_transcript': 'false',
-    }
-    
+    headers = {"X-Api-Key": FATHOM_API_KEY, "Content-Type": "application/json"}
+    params = {"include_action_items": "true", "include_summary": "true", "include_transcript": "true"}
+
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
         response.raise_for_status()
         data = response.json()
-        
-        # Find the meeting with matching recording_id
-        meeting = None
-        if 'items' in data:
-            for item in data['items']:
-                if str(item.get('recording_id')) == str(call_id):
-                    # If participant filter is set, check if meeting has that participant
-                    if participant_filter:
-                        if meeting_has_participant(item, participant_filter):
-                            meeting = item
-                            break
-                    else:
-                        meeting = item
-                        break
-        
-        if not meeting:
-            # Try paginating
-            cursor = data.get('next_cursor')
-            while cursor and not meeting:
-                params['cursor'] = cursor
-                response = requests.get(url, headers=headers, params=params)
-                response.raise_for_status()
-                page_data = response.json()
-                for item in page_data.get('items', []):
-                    if str(item.get('recording_id')) == str(call_id):
-                        # If participant filter is set, check if meeting has that participant
-                        if participant_filter:
-                            if meeting_has_participant(item, participant_filter):
-                                meeting = item
-                                break
-                        else:
-                            meeting = item
-                            break
-                cursor = page_data.get('next_cursor')
-        
-        if meeting:
-            # Return the meeting ID (id field)
-            return meeting.get('id')
-        
-        return None
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching meeting ID: {str(e)}")
-        return None
 
-def fetch_fathom_call_data(recording_id):
-    """
-    Fetch detailed call data from Fathom API including recording URL,
-    summary, title, and action items.
-    Uses the Fathom API: https://developers.fathom.ai/api-reference/meetings/list-meetings
-    """
-    
-    # Fathom API endpoint - list meetings and filter by recording_id
-    # Since there's no direct GET /meetings/{id} endpoint, we filter the list
-    url = "https://api.fathom.ai/external/v1/meetings"
-    headers = {
-        'X-Api-Key': FATHOM_API_KEY,
-        'Content-Type': 'application/json'
-    }
-    
-    # Query parameters to get full meeting details
-    params = {
-        'include_action_items': 'true',
-        'include_summary': 'true',
-        'include_transcript': 'false',  # Set to true if you need transcript
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Find the meeting with matching recording_id
         meeting = None
-        if 'items' in data:
-            for item in data['items']:
-                if str(item.get('recording_id')) == str(recording_id):
-                    meeting = item
-                    break
-        
+        for item in data.get("items", []):
+            if str(item.get("recording_id")) == str(recording_id):
+                meeting = item
+                break
+
         if not meeting:
-            # If not found in first page, try paginating (though unlikely for webhook)
-            print(f"Meeting {recording_id} not found in first page, checking pagination...")
-            cursor = data.get('next_cursor')
+            cursor = data.get("next_cursor")
             while cursor and not meeting:
-                params['cursor'] = cursor
-                response = requests.get(url, headers=headers, params=params)
+                params["cursor"] = cursor
+                response = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
                 response.raise_for_status()
                 page_data = response.json()
-                for item in page_data.get('items', []):
-                    if str(item.get('recording_id')) == str(recording_id):
+                for item in page_data.get("items", []):
+                    if str(item.get("recording_id")) == str(recording_id):
                         meeting = item
                         break
-                cursor = page_data.get('next_cursor')
-        
+                cursor = page_data.get("next_cursor")
+
         if not meeting:
-            print(f"Error: Meeting with recording_id {recording_id} not found")
+            _log("fathom_meeting_not_found", recording_id=str(recording_id))
             return None
-        
-        # Extract summary text from markdown
-        summary_text = ''
-        if meeting.get('default_summary'):
-            summary_text = meeting['default_summary'].get('markdown_formatted', '')
-        
-        # Format participants from calendar_invitees
-        participants = []
-        for invitee in meeting.get('calendar_invitees', []):
-            participants.append(invitee.get('name', invitee.get('email', '')))
-        
-        # Format action items - extract description and assignee name
+
+        summary_text = ""
+        if meeting.get("default_summary"):
+            summary_text = meeting["default_summary"].get("markdown_formatted", "")
+
+        participants = [invitee.get("name", invitee.get("email", "")) for invitee in meeting.get("calendar_invitees", [])]
+
         action_items = []
-        for item in meeting.get('action_items', []):
-            action_item = {
-                'description': item.get('description', ''),
-                'assignee': None
-            }
-            if item.get('assignee'):
-                action_item['assignee'] = item['assignee'].get('name')
+        for item in meeting.get("action_items", []):
+            action_item = {"description": item.get("description", ""), "assignee": None}
+            if item.get("assignee"):
+                action_item["assignee"] = item["assignee"].get("name")
             action_items.append(action_item)
-        
-        # Calculate duration if not provided
+
         duration = None
-        if meeting.get('recording_start_time') and meeting.get('recording_end_time'):
+        if meeting.get("recording_start_time") and meeting.get("recording_end_time"):
             try:
-                start = datetime.fromisoformat(meeting['recording_start_time'].replace('Z', '+00:00'))
-                end = datetime.fromisoformat(meeting['recording_end_time'].replace('Z', '+00:00'))
-                duration_seconds = (end - start).total_seconds()
-                duration = int(duration_seconds)
-            except:
+                start = datetime.fromisoformat(meeting["recording_start_time"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(meeting["recording_end_time"].replace("Z", "+00:00"))
+                duration = int((end - start).total_seconds())
+            except Exception:
                 pass
 
-        # Prepare URLs
-        recording_url = meeting.get('url') or meeting.get('share_url')
-        embed_url = None
-        if recording_url:
-            embed_url = recording_url.replace('/share/', '/embed/')
+        recording_url = meeting.get("url")
+        share_url = meeting.get("share_url")
+        embed_url = meeting.get("share_url").replace("/share/", "/embed/") if share_url else None
 
-        # Extract relevant fields matching the expected structure
-        call_info = {
-            'call_id': str(recording_id),  # Keep for backward compatibility
-            'recording_id': recording_id,
-            'meeting_id': meeting.get('id'),  # Meeting ID from Fathom
-            'title': meeting.get('title') or meeting.get('meeting_title', 'Untitled Meeting'),
-            'start_time': meeting.get('recording_start_time') or meeting.get('scheduled_start_time'),
-            'end_time': meeting.get('recording_end_time') or meeting.get('scheduled_end_time'),
-            'duration': duration,
-            'recording_url': recording_url,
-            'embed_url': embed_url,   # <--- New Field
-            'summary': summary_text,
-            'action_items': action_items,
-            'participants': participants,
-            'transcript_url': None  # Not directly available in this endpoint
+        # Extract transcript text and URL
+        transcript_text = ""
+        transcript_url = None
+        if meeting.get("transcript"):
+            # Transcript can be a string or object with text/url
+            transcript_data = meeting.get("transcript")
+            if isinstance(transcript_data, dict):
+                transcript_text = transcript_data.get("text", "") or transcript_data.get("markdown_formatted", "")
+                transcript_url = transcript_data.get("url")
+            elif isinstance(transcript_data, str):
+                transcript_text = transcript_data
+        
+        # Fallback: check for transcript_url field directly
+        if not transcript_url and meeting.get("transcript_url"):
+            transcript_url = meeting.get("transcript_url")
+
+        return {
+            "call_id": str(recording_id),
+            "recording_id": recording_id,
+            "meeting_id": meeting.get("id"),
+            "title": meeting.get("title") or meeting.get("meeting_title", "Untitled Meeting"),
+            "start_time": meeting.get("recording_start_time") or meeting.get("scheduled_start_time"),
+            "end_time": meeting.get("recording_end_time") or meeting.get("scheduled_end_time"),
+            "duration": duration,
+            "recording_url": recording_url,
+            "embed_url": embed_url,
+            "share_url": share_url,
+            "summary": summary_text,
+            "action_items": action_items,
+            "participants": participants,
+            "transcript_url": transcript_url,
+            "transcript": transcript_text,
         }
-        
-        return call_info
-        
-        
+
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching Fathom call data: {str(e)}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response status: {e.response.status_code}")
-            print(f"Response body: {e.response.text}")
+        _log("fathom_request_error", recording_id=str(recording_id), error=str(e))
+        if hasattr(e, "response") and e.response is not None:
+            _log("fathom_response", status=e.response.status_code, body=e.response.text[:5000])
         return None
 
 
-def get_linked_record_fields(table_name):
-    """
-    Get list of field names that are linked record fields in the given table.
-    Returns a set of field names.
-    """
+def get_linked_record_fields(table_name: str) -> set[str]:
     try:
         url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
-        headers = {
-            'Authorization': f'Bearer {AIRTABLE_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            for table in data.get('tables', []):
-                if table.get('name') == table_name:
-                    linked_fields = set()
-                    for field in table.get('fields', []):
-                        field_type = field.get('type')
-                        if field_type in ['multipleRecordLinks', 'singleCollaborator', 'multipleCollaborators']:
-                            linked_fields.add(field.get('name'))
-                    return linked_fields
+        headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+        response = requests.get(url, headers=headers, timeout=TIMEOUT)
+        if response.status_code != 200:
+            return set()
+        data = response.json()
+        for table in data.get("tables", []):
+            if table.get("name") == table_name:
+                linked_fields = set()
+                for field in table.get("fields", []):
+                    if field.get("type") in ["multipleRecordLinks", "singleCollaborator", "multipleCollaborators"]:
+                        linked_fields.add(field.get("name"))
+                return linked_fields
     except Exception as e:
-        print(f"Warning: Could not fetch table schema: {e}")
+        _log("airtable_schema_error", table=table_name, error=str(e))
     return set()
 
-def reformat_name(name):
-    """
-    Reformat name from "Last Name, First Name" to "First Name Last Name".
-    If no comma, returns name as-is.
-    """
+
+def reformat_name(name: Optional[str]) -> Optional[str]:
     if not name:
         return name
-    
     name = name.strip()
-    # Check if name is in "Last Name, First Name" format
-    if ',' in name:
-        parts = [part.strip() for part in name.split(',', 1)]
+    if "," in name:
+        parts = [part.strip() for part in name.split(",", 1)]
         if len(parts) == 2:
-            # Swap: Last Name, First Name -> First Name Last Name
             return f"{parts[1]} {parts[0]}"
-    
     return name
 
-def find_or_create_participant(participant_name):
-    """
-    Find a person record by name in the People table, or create it if it doesn't exist.
-    Used for both meeting participants and action item assignees.
-    Returns the record ID.
-    Note: Name should already be reformatted to "First Name Last Name" format before calling.
-    """
+
+def find_or_create_participant(participant_name: str) -> Optional[str]:
     if not participant_name:
         return None
-    
+
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_PARTICIPANTS_TABLE}"
-    headers = {
-        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    
-    # First, try to find existing participant by name
-    # We'll search for records where Name field matches
-    # Escape single quotes in participant name for Airtable formula
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+
     escaped_name = participant_name.replace("'", "''")
     formula = f"{{Name}} = '{escaped_name}'"
-    params = {
-        'filterByFormula': formula,
-        'maxRecords': 1
-    }
-    
+    params = {"filterByFormula": formula, "maxRecords": 1}
+
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
         if response.status_code == 200:
             data = response.json()
-            if data.get('records') and len(data.get('records', [])) > 0:
-                # Found existing record
-                record_id = data['records'][0]['id']
-                print(f"Found existing participant: {participant_name} ({record_id})")
-                return record_id
-        
-        # Participant doesn't exist, create it
-        # Try different common field names for the name field
-        name_fields = ['Name', 'Participant', 'Full Name', 'Email']
-        create_data = {}
-        
-        # Try to get the schema to find the correct name field
+            if data.get("records"):
+                return data["records"][0]["id"]
+
         schema_url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
-        schema_response = requests.get(schema_url, headers=headers, timeout=10)
-        name_field = 'Name'  # Default
-        
+        schema_response = requests.get(schema_url, headers=headers, timeout=TIMEOUT)
+        name_field = "Name"
         if schema_response.status_code == 200:
             schema_data = schema_response.json()
-            for table in schema_data.get('tables', []):
-                if table.get('name') == AIRTABLE_PARTICIPANTS_TABLE:
-                    # Find the first text field or name-like field
-                    for field in table.get('fields', []):
-                        if field.get('type') == 'singleLineText' or field.get('type') == 'email':
-                            name_field = field.get('name')
+            for table in schema_data.get("tables", []):
+                if table.get("name") == AIRTABLE_PARTICIPANTS_TABLE:
+                    for field in table.get("fields", []):
+                        if field.get("type") in ["singleLineText", "email"]:
+                            name_field = field.get("name")
                             break
                     break
-        
-        create_data['fields'] = {name_field: participant_name}
-        
-        create_response = requests.post(url, headers=headers, json=create_data, timeout=10)
+
+        create_data = {"fields": {name_field: participant_name}}
+        create_response = requests.post(url, headers=headers, json=create_data, timeout=TIMEOUT)
         if create_response.status_code == 200:
-            record_id = create_response.json().get('id')
-            print(f"Created new participant: {participant_name} ({record_id})")
-            return record_id
-        else:
-            print(f"Error creating participant {participant_name}: {create_response.status_code} - {create_response.text}")
-            return None
-            
+            return create_response.json().get("id")
+
+        _log("airtable_create_participant_failed", status=create_response.status_code, body=create_response.text[:5000])
+        return None
+
     except Exception as e:
-        print(f"Error finding/creating participant {participant_name}: {e}")
+        _log("airtable_participant_error", name=participant_name, error=str(e))
         return None
 
-def upload_meeting_to_airtable(call_data):
-    """
-    Upload the Fathom meeting data to the Meetings table in Airtable.
-    """
-    
+
+def upload_meeting_to_airtable(call_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_MEETINGS_TABLE}"
-    headers = {
-        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    
-    # Get linked record fields to skip them (we don't have record IDs)
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+
     linked_record_fields = get_linked_record_fields(AIRTABLE_MEETINGS_TABLE)
-    if linked_record_fields:
-        print(f"DEBUG: Found linked record fields: {linked_record_fields}")
-    
-    # Get participant names and reformat them
+
     participant_names = [
-        reformat_name(str(p.get('name', p) if isinstance(p, dict) else p))
-        for p in call_data.get('participants', [])
+        reformat_name(str(p.get("name", p) if isinstance(p, dict) else p)) for p in call_data.get("participants", [])
     ]
-    
-    # Find or create participant records in People table and get their IDs
-    participant_record_ids = []
-    if 'Participants' in linked_record_fields and participant_names:
-        print(f"Finding/creating {len(participant_names)} participant records in People table...")
+
+    participant_record_ids: list[str] = []
+    if "Participants" in linked_record_fields and participant_names:
         for participant_name in participant_names:
-            record_id = find_or_create_participant(participant_name)
-            if record_id:
-                participant_record_ids.append(record_id)
-        print(f"Got {len(participant_record_ids)} participant record IDs")
-    
-    # Prepare the Airtable record for meetings table
-    # Only include fields that have values (skip None) and skip linked record fields
-    fields = {}
-    
-    # Title - string
-    if call_data.get('title') and 'Title' not in linked_record_fields:
-        fields['Title'] = str(call_data.get('title'))
-    
-    # Recording URL - string
-    if call_data.get('recording_url') and 'Recording URL' not in linked_record_fields:
-        fields['Recording URL'] = str(call_data.get('recording_url'))
+            rid = find_or_create_participant(participant_name)
+            if rid:
+                participant_record_ids.append(rid)
 
-   
-    # Embed URL - string
-    if call_data.get('embed_url') and 'Embed URL' not in linked_record_fields:
-        fields['Embed URL'] = str(call_data.get('embed_url'))
+    fields: Dict[str, Any] = {}
+    if call_data.get("title") and "Title" not in linked_record_fields:
+        fields["Title"] = str(call_data.get("title"))
+    if call_data.get("recording_url") and "Recording URL" not in linked_record_fields:
+        fields["Recording URL"] = str(call_data.get("recording_url"))
+    if call_data.get("embed_url") and "Embed URL" not in linked_record_fields:
+        fields["Embed URL"] = str(call_data.get("embed_url"))
+    if call_data.get("share_url") and "Share URL" not in linked_record_fields:
+        fields["Share URL"] = str(call_data.get("share_url"))
+    if call_data.get("summary") and "Summary" not in linked_record_fields:
+        fields["Summary"] = str(call_data.get("summary"))
+    if call_data.get("start_time") and "Start Time" not in linked_record_fields:
+        fields["Start Time"] = str(call_data.get("start_time"))
 
-    # Summary - string
-    if call_data.get('summary') and 'Summary' not in linked_record_fields:
-        fields['Summary'] = str(call_data.get('summary'))
-    
-    # Start Time - string (ISO format)
-    if call_data.get('start_time') and 'Start Time' not in linked_record_fields:
-        fields['Start Time'] = str(call_data.get('start_time'))
-    
-    # Duration - integer (only include if not None)
-    duration = call_data.get('duration')
-    if duration is not None and 'Duration' not in linked_record_fields:
+    duration = call_data.get("duration")
+    if duration is not None and "Duration" not in linked_record_fields:
         try:
-            fields['Duration'] = int(duration)
-        except (ValueError, TypeError):
-            # Skip if duration can't be converted to int
+            fields["Duration"] = int(duration)
+        except Exception:
             pass
-    
-    # Participants - handle based on field type
-    if 'Participants' in linked_record_fields:
-        # It's a linked record field - use record IDs
+
+    if "Participants" in linked_record_fields:
         if participant_record_ids:
-            fields['Participants'] = participant_record_ids
+            fields["Participants"] = participant_record_ids
     else:
-        # If it's not a linked record field, send as array of strings
         if participant_names:
-            fields['Participants'] = participant_names
+            fields["Participants"] = participant_names
+
+    call_id = call_data.get("call_id") or call_data.get("recording_id")
+    if call_id and "Fathom Call ID" not in linked_record_fields:
+        fields["Fathom Call ID"] = str(call_id)
+
+    if call_data.get("transcript_url") and "Transcript URL" not in linked_record_fields:
+        fields["Transcript URL"] = str(call_data.get("transcript_url"))
     
-    # Fathom Call ID - string (convert to string)
-    call_id = call_data.get('call_id') or call_data.get('recording_id')
-    if call_id and 'Fathom Call ID' not in linked_record_fields:
-        fields['Fathom Call ID'] = str(call_id)
-    
-    # Transcript URL - string
-    if call_data.get('transcript_url') and 'Transcript URL' not in linked_record_fields:
-        fields['Transcript URL'] = str(call_data.get('transcript_url'))
-    
-    airtable_record = {
-        'fields': fields
-    }
-    
+    if call_data.get("transcript") and "Transcript" not in linked_record_fields:
+        fields["Transcript"] = str(call_data.get("transcript"))
+
+    airtable_record = {"fields": fields}
+    _log("airtable_meeting_create", fields=list(fields.keys()))
+
     try:
-        # Debug: print what we're sending
-        print(f"DEBUG: Sending fields to Airtable: {list(fields.keys())}")
-        response = requests.post(url, headers=headers, json=airtable_record)
-        response.raise_for_status()
+        response = requests.post(url, headers=headers, json=airtable_record, timeout=TIMEOUT)
+        if response.status_code >= 400:
+            _log("airtable_meeting_create_failed", status=response.status_code, body=response.text[:5000], fields=fields)
+            return None
         return response.json()
-        
     except requests.exceptions.RequestException as e:
-        print(f"Error uploading meeting to Airtable: {str(e)}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response status: {e.response.status_code}")
-            print(f"Response body: {e.response.text}")
-            # Try to identify which field is problematic
-            try:
-                error_data = e.response.json()
-                if 'error' in error_data:
-                    print(f"Error details: {error_data['error']}")
-            except:
-                pass
-        print(f"DEBUG: Fields being sent: {fields}")
+        _log("airtable_meeting_request_error", error=str(e), fields=fields)
         return None
 
 
-def extract_assignee(action_item_text):
-    """
-    Extract the assignee from action item text.
-    Looks for patterns like:
-    - @Name
-    - [Name]
-    - Name:
-    - Assigned to Name
-    - Name to do something
-    """
-    
-    # Pattern 1: @mention
-    mention_match = re.search(r'@(\w+(?:\s+\w+)?)', action_item_text)
+def extract_assignee(action_item_text: str) -> Optional[str]:
+    mention_match = re.search(r"@(\w+(?:\s+\w+)?)", action_item_text)
     if mention_match:
         return mention_match.group(1).strip()
-    
-    # Pattern 2: [Name]
-    bracket_match = re.search(r'\[([^\]]+)\]', action_item_text)
+    bracket_match = re.search(r"\[([^\]]+)\]", action_item_text)
     if bracket_match:
         return bracket_match.group(1).strip()
-    
-    # Pattern 3: "Assigned to Name" or "assigned: Name"
-    assigned_match = re.search(r'[Aa]ssigned\s+(?:to\s+)?:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', action_item_text)
+    assigned_match = re.search(
+        r"[Aa]ssigned\s+(?:to\s+)?:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", action_item_text
+    )
     if assigned_match:
         return assigned_match.group(1).strip()
-    
-    # Pattern 4: "Name:" at the start
-    colon_match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*:', action_item_text)
+    colon_match = re.search(r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*:", action_item_text)
     if colon_match:
         return colon_match.group(1).strip()
-    
-    # Pattern 5: "Name to [verb]" or "Name will"
-    action_match = re.search(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:to|will|should|needs to)\s+', action_item_text)
+    action_match = re.search(r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:to|will|should|needs to)\s+", action_item_text)
     if action_match:
         return action_match.group(1).strip()
-    
     return None
 
 
-def create_action_items(action_items, meeting_record_id, meeting_title):
-    """
-    Create individual action item records in Airtable, 
-    extracting and assigning to mentioned persons.
-    """
-    
+def create_action_items(action_items: list[Any], meeting_record_id: str, meeting_title: Optional[str]) -> int:
     if not action_items:
         return 0
-    
+
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_ACTION_ITEMS_TABLE}"
-    headers = {
-        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    
-    # Get linked record fields to handle them properly
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+
     linked_record_fields = get_linked_record_fields(AIRTABLE_ACTION_ITEMS_TABLE)
-    if linked_record_fields:
-        print(f"DEBUG: Action items table linked record fields: {linked_record_fields}")
-    
+
     created_count = 0
-    
     for item in action_items:
-        # Handle both string and dict formats
         if isinstance(item, dict):
-            item_text = item.get('text', '') or item.get('description', '')
-            # Assignee can be a string (name) or dict with name/email
-            item_assignee = item.get('assignee')
+            item_text = item.get("text", "") or item.get("description", "")
+            item_assignee = item.get("assignee")
             if isinstance(item_assignee, dict):
-                item_assignee = item_assignee.get('name')
+                item_assignee = item_assignee.get("name")
         else:
             item_text = str(item)
             item_assignee = None
-        
+
         if not item_text:
             continue
-        
-        # Extract assignee if not already provided
+
         if not item_assignee:
             item_assignee = extract_assignee(item_text)
-        
-        # Reformat assignee name: "Last Name, First Name" -> "First Name Last Name"
         if item_assignee:
             item_assignee = reformat_name(item_assignee)
-        
-        # Find or create assignee record in People table if assignee exists
-        assignee_record_id = None
-        if item_assignee:
-            assignee_record_id = find_or_create_participant(item_assignee)
-            if not assignee_record_id:
-                print(f"Warning: Could not find or create assignee in People table: {item_assignee}")
-        
-        # Prepare action item record - only include fields that exist and have values
-        fields = {}
-        
-        # Description - Action item description goes to Description field in Airtable
-        if item_text:
-            fields['Description'] = str(item_text)
-        
-        # Status - string (should be a select field)
-        fields['Status'] = 'To Do'
-        
-        # Meeting - linked record (array of record IDs)
-        # Meeting should always be a linked record field linking to Meetings table
-        if meeting_record_id:
-            fields['Meeting'] = [meeting_record_id]
-        
-        # Assigned To - linked record field (use record ID if it's a linked record field)
-        if assignee_record_id:
-            fields['Assigned To'] = [assignee_record_id]
-        elif item_assignee and 'Assigned To' not in linked_record_fields:
-            # If it's not a linked record field, send as string
-            fields['Assigned To'] = str(item_assignee)
-        
-        if not fields:
-            print(f"Warning: No valid fields to create action item: {item_text[:50]}...")
-            continue
-        
-        action_item_record = {
-            'fields': fields
+
+        assignee_record_id = find_or_create_participant(item_assignee) if item_assignee else None
+
+        fields: Dict[str, Any] = {
+            "Description": str(item_text),
+            "Status": "To Do",
+            "Meeting": [meeting_record_id],
         }
-        
+
+        if assignee_record_id:
+            fields["Assigned To"] = [assignee_record_id]
+        elif item_assignee and "Assigned To" not in linked_record_fields:
+            fields["Assigned To"] = str(item_assignee)
+
+        action_item_record = {"fields": fields}
+
         try:
-            response = requests.post(url, headers=headers, json=action_item_record)
-            response.raise_for_status()
+            response = requests.post(url, headers=headers, json=action_item_record, timeout=TIMEOUT)
+            if response.status_code >= 400:
+                _log("airtable_action_item_failed", status=response.status_code, body=response.text[:2000])
+                continue
             created_count += 1
-            print(f"Created action item: {item_text[:50]}... (Assigned to: {item_assignee or 'Unassigned'})")
-            
         except requests.exceptions.RequestException as e:
-            print(f"Error creating action item: {str(e)}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"Response status: {e.response.status_code}")
-                print(f"Response body: {e.response.text}")
-            print(f"DEBUG: Fields being sent: {fields}")
+            _log("airtable_action_item_request_error", error=str(e))
             continue
-    
+
     return created_count
+
